@@ -5,14 +5,18 @@ import { execSync } from "node:child_process";
 import { remember, profile } from "./memory.js";
 import { vitals } from "./system.js";
 import { askAI } from "./ai.js";
+import { list as clipList, recopy as clipRecopy } from "./clipboard.js";
 
 type Confirm = (prompt: string) => Promise<boolean>;
+type Args = Record<string, any>;
 
 export interface Skill {
   name: string;
   help: string;
-  patterns: RegExp[];
-  run: (input: string, confirm: Confirm) => Promise<void>;
+  description: string;              // what the AI reads to decide when to use this
+  parameters: Record<string, any>;  // JSON schema the AI fills in
+  patterns: RegExp[];               // offline fallback matching
+  run: (input: string, args: Args, confirm: Confirm) => Promise<void>;
 }
 
 const WIN = process.platform === "win32";
@@ -101,7 +105,7 @@ function locateFromPhrase(input: string): { target: string | null; others: strin
   const cleaned = input.toLowerCase()
     .replace(/\b(read|summar(y|ise|ize)|explain|review|analy[sz]e|rewrite|improve|proofread|critique|open|show me|contents? of|cat)\b/gi, " ")
     .replace(/\b(the|my|this|that|a|an|for|to|it|please|can|you|could|what'?s?|wrong|with|does|say|of|and|is|are|me|in|on|about)\b/gi, " ")
-    .replace(/[^\w.\s/~-]/g, " ")
+    .replace(/[^\w.\s\/~-]/g, " ")
     .trim();
   const pathTok = cleaned.match(/(~?\/[^\s]+|\S+\.\w{1,6})/)?.[0];
   const words = cleaned.split(/\s+/).filter((w) => w.length >= 2).sort((a, b) => b.length - a.length);
@@ -135,18 +139,24 @@ function categoryFor(ext: string): string {
   return "Other";
 }
 
+const OBJ = (props: Record<string, any> = {}, required: string[] = []) => ({ type: "OBJECT", properties: props, required });
+const STR = (description: string) => ({ type: "STRING", description });
+const NUM = (description: string) => ({ type: "NUMBER", description });
+
 export const skills: Skill[] = [
   {
     name: "understand",
     help: "summarize / explain / review <file> — the AI reads a file (incl. PDFs) and helps.",
+    description: "Read a file on the user's computer (plain text or PDF) and summarize, explain, review, proofread, analyze, rewrite, or critique it. Use when the user refers to a document, note, essay, script, resume, readme, or code file.",
+    parameters: OBJ({ file: STR("Name, partial name, or path of the file. e.g. 'vodcast script' or 'notes.txt'.") }, ["file"]),
     patterns: [/\b(summar(y|ise|ize)|explain|proofread|review|analy[sz]e|rewrite|improve|critique|what'?s wrong with|what does)\b.*\b(file|doc|document|note|essay|code|script|letter|resume|cv|readme|vodcast|podcast|\.\w{1,6})\b/i],
-    run: async (input) => {
-      const { target, others, tried } = locateFromPhrase(input);
+    run: async (input, args) => {
+      const phrase = args.file ? String(args.file) : input;
+      const { target, others, tried } = locateFromPhrase(phrase);
       if (!target) { console.log(`Couldn't find a file from that. I looked for: ${tried.slice(0, 5).join(", ")}. Try naming it, or tell me the folder.`); return; }
       console.log(`📄 Reading ${target} …`);
       const { text, note } = await readTextFile(target);
       if (!text) { console.log(note); return; }
-      // Send the full file to the model, but remember only the short command.
       const answer = await askAI(`${input}\n\nHere is the file "${path.basename(target)}":\n\n${text.slice(0, 12000)}`, input);
       console.log(`\n${answer}`);
       if (others.length) console.log(`\n(If you meant a different file: ${others.map((o) => path.basename(o)).join(", ")})`);
@@ -155,9 +165,12 @@ export const skills: Skill[] = [
   {
     name: "read",
     help: "read <file> — print a text or PDF file's contents (just name it).",
+    description: "Print the raw contents of a text or PDF file to the terminal, without AI analysis. Use when the user just wants to SEE what's in a file.",
+    parameters: OBJ({ file: STR("Name, partial name, or path of the file to display.") }, ["file"]),
     patterns: [/\bread\b/i, /\bcat\b/i, /\bcontents? of\b/i, /\bshow me\b.*\.\w+/i],
-    run: async (input) => {
-      const { target, others } = locateFromPhrase(input);
+    run: async (input, args) => {
+      const phrase = args.file ? String(args.file) : input;
+      const { target, others } = locateFromPhrase(phrase);
       if (!target || fs.statSync(target).isDirectory()) { console.log(`Couldn't find that file. Try: read notes`); return; }
       const { text, note } = await readTextFile(target);
       if (!text) { console.log(note); return; }
@@ -169,13 +182,18 @@ export const skills: Skill[] = [
   {
     name: "newfile",
     help: "create file <name> — make a new empty file.",
+    description: "Create a new empty file. Use for 'make a file', 'create a new document called X', etc.",
+    parameters: OBJ({
+      name: STR("The filename to create, e.g. 'notes.txt'."),
+      folder: STR("Where to create it: 'downloads', 'desktop', 'documents', or a path. Optional."),
+    }, ["name"]),
     patterns: [/\b(create|make|new)\b.*\bfile\b/i, /\btouch\b/i],
-    run: async (input) => {
-      const m = input.match(/file\s+(?:called\s+|named\s+|name\s+)?["']?(.+?)["']?(?:\s+(?:in|on|under|inside)\b.*)?$/i)
-        || input.match(/touch\s+["']?(.+?)["']?$/i);
-      const name = m?.[1]?.trim();
+    run: async (input, args) => {
+      const name = (args.name
+        ?? input.match(/file\s+(?:called\s+|named\s+|name\s+)?["']?(.+?)["']?(?:\s+(?:in|on|under|inside)\b.*)?$/i)?.[1]
+        ?? input.match(/touch\s+["']?(.+?)["']?$/i)?.[1])?.toString().trim();
       if (!name) { console.log("What should I call it? Try: create file called notes.txt"); return; }
-      const full = path.join(resolveDir(input), name);
+      const full = path.join(resolveDir(args.folder ? String(args.folder) : input), name);
       if (fs.existsSync(full)) { console.log(`"${name}" already exists.`); return; }
       fs.writeFileSync(full, "");
       console.log(`📄 Created ${full}`);
@@ -184,12 +202,17 @@ export const skills: Skill[] = [
   {
     name: "newfolder",
     help: "create folder <name> in <folder> — make a new folder.",
+    description: "Create a new folder/directory. Use for 'make a folder', 'create a new directory called X', etc.",
+    parameters: OBJ({
+      name: STR("The folder name to create."),
+      folder: STR("Where to create it: 'downloads', 'desktop', 'documents', or a path. Optional."),
+    }, ["name"]),
     patterns: [/\b(create|make|new)\b.*\bfolder\b/i, /\bmkdir\b/i],
-    run: async (input) => {
-      const m = input.match(/folder\s+(?:called\s+|named\s+|name\s+)?["']?(.+?)["']?(?:\s+(?:in|on|under|inside)\b.*)?$/i);
-      const name = m?.[1]?.trim();
+    run: async (input, args) => {
+      const name = (args.name
+        ?? input.match(/folder\s+(?:called\s+|named\s+|name\s+)?["']?(.+?)["']?(?:\s+(?:in|on|under|inside)\b.*)?$/i)?.[1])?.toString().trim();
       if (!name) { console.log("What should I call it? Try: create folder Projects in documents"); return; }
-      const full = path.join(resolveDir(input), name);
+      const full = path.join(resolveDir(args.folder ? String(args.folder) : input), name);
       fs.mkdirSync(full, { recursive: true });
       console.log(`📁 Created ${full}`);
     },
@@ -197,9 +220,11 @@ export const skills: Skill[] = [
   {
     name: "scan",
     help: "scan <folder> / what's in <folder> — list every file grouped by type.",
+    description: "List the contents of a folder, grouped by file type, with sizes. Use for 'what's in my downloads', 'scan desktop', etc.",
+    parameters: OBJ({ folder: STR("Which folder: 'downloads', 'desktop', 'documents', or a path. Optional (defaults to current folder).") }),
     patterns: [/\bscan\b/i, /\bwhat'?s in\b/i, /\blist\b.*\b(file|folder)/i],
-    run: async (input) => {
-      const dir = resolveDir(input);
+    run: async (input, args) => {
+      const dir = resolveDir(args.folder ? String(args.folder) : input);
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => !e.name.startsWith(".")); }
       catch { console.log(`Can't read ${dir}.`); return; }
@@ -226,9 +251,11 @@ export const skills: Skill[] = [
   {
     name: "organize",
     help: "organize <folder> — preview then tidy into subfolders (undoable).",
+    description: "Tidy a messy folder by sorting its loose files into subfolders by type (Images, Documents, etc). Shows a preview and asks before moving. Undoable.",
+    parameters: OBJ({ folder: STR("Which folder to organize: 'downloads', 'desktop', 'documents', or a path. Optional.") }),
     patterns: [/\borgan/i, /\btidy\b/i, /\bsort\b/i, /\bclean ?up\b/i],
-    run: async (input, confirm) => {
-      const dir = resolveDir(input);
+    run: async (input, args, confirm) => {
+      const dir = resolveDir(args.folder ? String(args.folder) : input);
       const files = fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isFile() && !e.name.startsWith("."));
       if (files.length === 0) { console.log(`Nothing to organize in ${dir}.`); return; }
       const plan: Record<string, string[]> = {};
@@ -257,6 +284,8 @@ export const skills: Skill[] = [
   {
     name: "undo",
     help: "undo — reverse the last organize.",
+    description: "Reverse the most recent 'organize' operation, putting all moved files back where they were.",
+    parameters: OBJ(),
     patterns: [/\bundo\b/i, /\brevert\b/i, /\bput (it|them|everything) back\b/i],
     run: async () => {
       let moves: { from: string; to: string }[];
@@ -271,13 +300,22 @@ export const skills: Skill[] = [
   {
     name: "rename",
     help: "rename <old> to <new> — rename a file or folder (just name it).",
+    description: "Rename a file or folder. Asks before doing it.",
+    parameters: OBJ({
+      from: STR("The current name of the file/folder."),
+      to: STR("The new name."),
+    }, ["from", "to"]),
     patterns: [/\brename\b/i],
-    run: async (input, confirm) => {
-      const m = input.match(/rename\s+["']?(.+?)["']?\s+to\s+["']?(.+?)["']?$/i);
-      if (!m) { console.log("Try: rename old.txt to new.txt"); return; }
-      const from = resolveFile(m[1]) ?? locate(m[1])[0];
-      if (!from) { console.log(`Can't find "${m[1]}".`); return; }
-      const to = path.join(path.dirname(from), m[2].trim());
+    run: async (input, args, confirm) => {
+      let fromName = args.from, toName = args.to;
+      if (!fromName || !toName) {
+        const m = input.match(/rename\s+["']?(.+?)["']?\s+to\s+["']?(.+?)["']?$/i);
+        if (m) { fromName ??= m[1]; toName ??= m[2]; }
+      }
+      if (!fromName || !toName) { console.log("Try: rename old.txt to new.txt"); return; }
+      const from = resolveFile(String(fromName)) ?? locate(String(fromName))[0];
+      if (!from) { console.log(`Can't find "${fromName}".`); return; }
+      const to = path.join(path.dirname(from), String(toName).trim());
       if (!(await confirm(`Rename "${path.basename(from)}" → "${path.basename(to)}"?`))) return;
       fs.renameSync(from, to);
       console.log(`✅ Renamed to ${path.basename(to)}`);
@@ -286,10 +324,15 @@ export const skills: Skill[] = [
   {
     name: "find",
     help: "find <term> in <folder> — search for files by name.",
+    description: "Search for files whose name contains a term, within a folder (searches subfolders too).",
+    parameters: OBJ({
+      term: STR("The text to look for in file names."),
+      folder: STR("Which folder to search: 'downloads', 'desktop', 'documents', or a path. Optional."),
+    }, ["term"]),
     patterns: [/\bfind\b/i, /\bsearch\b/i, /\blocate\b/i, /\bwhere is\b/i],
-    run: async (input) => {
-      const dir = resolveDir(input);
-      const term = (input.match(/(?:find|search|locate|where is)\s+(.+?)(?:\s+in\b|$)/i)?.[1] ?? "").trim().toLowerCase();
+    run: async (input, args) => {
+      const dir = resolveDir(args.folder ? String(args.folder) : input);
+      const term = (args.term ?? input.match(/(?:find|search|locate|where is)\s+(.+?)(?:\s+in\b|$)/i)?.[1] ?? "").toString().trim().toLowerCase();
       if (!term) { console.log("What should I search for? Try: find invoice in downloads"); return; }
       const hits: string[] = [];
       const walk = (d: string, depth = 0) => {
@@ -308,9 +351,11 @@ export const skills: Skill[] = [
   {
     name: "open",
     help: "open <app or website> — e.g. 'open spotify' or 'open youtube.com'.",
+    description: "Open an app, a website, or a known folder. Asks before doing it.",
+    parameters: OBJ({ target: STR("What to open: an app name ('spotify'), a URL ('youtube.com'), or 'downloads'/'desktop'/'documents'.") }, ["target"]),
     patterns: [/^\s*open\b/i, /\blaunch\b/i],
-    run: async (input, confirm) => {
-      const target = input.replace(/^.*?\b(open|launch)\b\s*/i, "").trim().replace(/[.?!]$/, "");
+    run: async (input, args, confirm) => {
+      const target = (args.target ?? input.replace(/^.*?\b(open|launch)\b\s*/i, "")).toString().trim().replace(/[.?!]$/, "");
       if (!target) { console.log("Open what? Try: open spotify"); return; }
       if (!(await confirm(`Open ${target}?`))) return;
       const folders: Record<string, string> = { downloads: "Downloads", desktop: "Desktop", documents: "Documents" };
@@ -328,17 +373,26 @@ export const skills: Skill[] = [
   {
     name: "volume",
     help: "set volume to <0-100> / mute / unmute (macOS).",
+    description: "Set the system output volume (0-100), raise/lower it, or mute/unmute. macOS only.",
+    parameters: OBJ({
+      level: NUM("Target volume 0-100. Optional."),
+      action: { type: "STRING", enum: ["mute", "unmute", "up", "down"], description: "An action instead of a specific level. Optional." },
+    }),
     patterns: [/\bvolume\b/i, /\bmute\b/i, /\bunmute\b/i],
-    run: async (input) => {
+    run: async (input, args) => {
       if (WIN) { console.log("Volume control isn't supported on Windows yet (no clean built-in)."); return; }
-      if (/\bunmute\b/i.test(input)) { execSync(`osascript -e 'set volume output muted false'`); console.log("🔊 Unmuted."); return; }
-      if (/\bmute\b/i.test(input)) { execSync(`osascript -e 'set volume output muted true'`); console.log("🔇 Muted."); return; }
+      const action = args.action
+        ?? (/\bunmute\b/i.test(input) ? "unmute" : /\bmute\b/i.test(input) ? "mute"
+          : /\b(up|louder|raise|increase)\b/i.test(input) ? "up"
+          : /\b(down|lower|quieter|decrease)\b/i.test(input) ? "down" : undefined);
+      if (action === "unmute") { execSync(`osascript -e 'set volume output muted false'`); console.log("🔊 Unmuted."); return; }
+      if (action === "mute") { execSync(`osascript -e 'set volume output muted true'`); console.log("🔇 Muted."); return; }
       const cur = () => Number(sh(`osascript -e 'output volume of (get volume settings)'`)) || 0;
-      const num = input.match(/(\d{1,3})/);
       let level: number | null = null;
-      if (num) level = Number(num[1]);
-      else if (/\b(up|louder|raise|increase)\b/i.test(input)) level = cur() + 10;
-      else if (/\b(down|lower|quieter|decrease)\b/i.test(input)) level = cur() - 10;
+      if (typeof args.level === "number") level = args.level;
+      else { const num = input.match(/(\d{1,3})/); if (num) level = Number(num[1]); }
+      if (level === null && action === "up") level = cur() + 10;
+      if (level === null && action === "down") level = cur() - 10;
       if (level === null) { console.log(`🔊 Volume is at ${cur()}%.`); return; }
       level = Math.min(100, Math.max(0, level));
       execSync(`osascript -e 'set volume output volume ${level}'`);
@@ -346,10 +400,42 @@ export const skills: Skill[] = [
     },
   },
   {
+    name: "clipboard",
+    help: "clipboard — show what you've copied recently, or re-copy an item ('copy clipboard 3').",
+    description: "Show the user's recent clipboard history (things copied while Sprøut has been open), or copy a past item back onto the clipboard.",
+    parameters: OBJ({
+      action: { type: "STRING", enum: ["list", "copy"], description: "'list' to show history, 'copy' to put an item back." },
+      index: NUM("Which history item to copy back (the number shown in the list)."),
+    }),
+    patterns: [/\bclip ?board\b/i, /\bpaste history\b/i, /\bcopy history\b/i, /\bcopied (stuff|things|items|history)\b/i],
+    run: async (input, args) => {
+      const items = clipList();
+      const wantCopy = args.action === "copy" || /\b(re-?copy|put back|restore)\b/i.test(input) || (/\bcopy\b/i.test(input) && /\d/.test(input));
+      const idxMatch = input.match(/\b(\d{1,2})\b/);
+      const index = typeof args.index === "number" ? args.index : (idxMatch ? Number(idxMatch[1]) : null);
+      if (wantCopy && index != null) {
+        const h = clipRecopy(index - 1);
+        if (!h) { console.log(`There's no clipboard item #${index}.`); return; }
+        const line = h.text.replace(/\s+/g, " ").trim();
+        console.log(`📋 Copied item #${index} back to your clipboard:\n   ${line.slice(0, 80)}${line.length > 80 ? "…" : ""}`);
+        return;
+      }
+      if (!items.length) { console.log("📋 No clipboard history yet — I start recording once I'm open. Copy something and it'll show up here."); return; }
+      console.log(`📋 Recent clipboard (newest first):`);
+      items.slice(0, 15).forEach((h, i) => {
+        const line = h.text.replace(/\s+/g, " ").trim();
+        console.log(`   ${i + 1}. ${line.slice(0, 70)}${line.length > 70 ? "…" : ""}`);
+      });
+      console.log(`\n   Say "copy clipboard 2" to put one back.`);
+    },
+  },
+  {
     name: "trash",
     help: "empty trash — permanently clear your Trash / Recycle Bin.",
+    description: "Permanently empty the Trash (macOS) or Recycle Bin (Windows). Asks first.",
+    parameters: OBJ(),
     patterns: [/\bempty (the )?(trash|recycle)/i, /\bclear (the )?(trash|recycle)/i, /\btake out (the )?trash\b/i],
-    run: async (input, confirm) => {
+    run: async (input, args, confirm) => {
       if (!(await confirm("Permanently empty your Trash / Recycle Bin?"))) return;
       if (WIN) execSync(`powershell -NoProfile -Command "Clear-RecycleBin -Force -ErrorAction SilentlyContinue"`, { windowsHide: true });
       else execSync(`osascript -e 'tell application "Finder" to empty trash'`);
@@ -359,6 +445,8 @@ export const skills: Skill[] = [
   {
     name: "screenshot",
     help: "screenshot — capture the screen to your Desktop.",
+    description: "Take a screenshot of the screen and save it to the Desktop.",
+    parameters: OBJ(),
     patterns: [/\bscreenshot\b/i, /\bscreen ?cap/i, /\bcapture.*screen\b/i],
     run: async () => {
       const file = path.join(os.homedir(), "Desktop", `sprout-${Date.now()}.png`);
@@ -375,6 +463,8 @@ export const skills: Skill[] = [
   {
     name: "weather",
     help: "weather — current conditions for your location.",
+    description: "Get the current weather for the user's approximate location.",
+    parameters: OBJ(),
     patterns: [/\bweather\b/i, /\btemperature\b/i, /\bforecast\b/i, /\bhow('?s| is)? (it )?outside\b/i],
     run: async () => {
       try {
@@ -386,15 +476,19 @@ export const skills: Skill[] = [
   {
     name: "status",
     help: "status / vitals — full system dashboard.",
+    description: "Show the full system vitals dashboard: CPU, memory, disk, battery, uptime, and health tips.",
+    parameters: OBJ(),
     patterns: [/^\s*status\s*$/i, /^\s*vitals\s*$/i, /\bfull (status|report|dashboard|readout)\b/i],
     run: async () => { console.log(vitals()); },
   },
   {
     name: "remember",
     help: "remember <something> — save a fact about you.",
+    description: "Save a lasting fact about the user (their name, preferences, projects, interests) so Sprøut can recall it in future sessions.",
+    parameters: OBJ({ fact: STR("The fact to remember, e.g. 'I love drawing' or 'my sister is named Lena'.") }, ["fact"]),
     patterns: [/\bremember\b/i, /\bnote that\b/i, /\bdon'?t forget\b/i],
-    run: async (input) => {
-      const fact = input.replace(/^.*?\b(remember|note that|don'?t forget)\b\s*(that\s+)?/i, "").trim();
+    run: async (input, args) => {
+      const fact = (args.fact ?? input.replace(/^.*?\b(remember|note that|don'?t forget)\b\s*(that\s+)?/i, "")).toString().trim();
       if (!fact) { console.log("Remember what? Try: remember I love drawing"); return; }
       remember(fact);
       console.log(`🌱 Got it — I'll remember that ${fact}.`);
@@ -403,6 +497,8 @@ export const skills: Skill[] = [
   {
     name: "aboutme",
     help: "about me — show everything Sprøut remembers about you.",
+    description: "Show everything Sprøut has saved about the user.",
+    parameters: OBJ(),
     patterns: [/\babout me\b/i, /\bwhat do you know about me\b/i],
     run: async () => {
       const p = profile();

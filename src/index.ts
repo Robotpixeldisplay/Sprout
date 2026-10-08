@@ -2,7 +2,8 @@ import * as readline from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { match } from "./brain.js";
 import { skills } from "./skills.js";
-import { askAI, pickModel } from "./ai.js";
+import { route, isOnline } from "./ai.js";
+import { capture } from "./clipboard.js";
 
 const c = {
   reset: "\x1b[0m", dim: "\x1b[2m", bold: "\x1b[1m",
@@ -46,7 +47,7 @@ function banner() {
   console.log();
   art.forEach((line, i) => console.log(`  ${grad[i]}${c.bold}${line}${c.reset}`));
   console.log();
-  console.log(`  ${c.bgreen}🌱 Sprøut${c.reset}  ${c.gray}·${c.reset}  ${c.cyan}⚡ fast${c.reset} ${c.gray}+${c.reset} ${c.magenta}🧠 smart${c.reset}  ${c.gray}·${c.reset}  ${c.dim}${skills.length} skills loaded${c.reset}`);
+  console.log(`  ${c.bgreen}🌱 ancient Sprøut${c.reset}  ${c.gray}·${c.reset}  ${c.cyan}⚡ fast${c.reset} ${c.gray}+${c.reset} ${c.magenta}🧠 smart${c.reset}  ${c.gray}·${c.reset}  ${c.dim}${skills.length} skills loaded${c.reset}`);
   console.log(`  ${c.gray}type ${c.reset}${c.green}help${c.reset}${c.gray}  ·  ${c.reset}${c.green}try again${c.reset}${c.gray} to repeat  ·  ${c.reset}${c.green}exit${c.reset}${c.gray} to quit${c.reset}`);
   console.log();
 }
@@ -58,8 +59,24 @@ async function boot() {
   banner();
 }
 
+// Build the tool list the AI router picks from — straight off the skills.
+const tools = skills.map((s) => ({ name: s.name, description: s.description, parameters: s.parameters }));
+
+async function runSkill(name: string, input: string, args: Record<string, any>) {
+  const skill = skills.find((s) => s.name === name);
+  if (!skill) { console.log(`${c.dim}(unknown action: ${name})${c.reset}`); return; }
+  try { await skill.run(input, args, confirm); }
+  catch (err: any) { console.log(`${c.yellow}Something went wrong: ${err.message}${c.reset}`); }
+}
+
 async function main() {
   await boot();
+
+  // Start recording clipboard history while Sprøut is open.
+  capture();
+  const clipTimer = setInterval(capture, 2000);
+  clipTimer.unref(); // don't let this timer keep the process alive on exit
+
   let lastInput = "";
 
   while (true) {
@@ -81,23 +98,37 @@ async function main() {
       continue;
     }
 
-    const skill = match(input);
-    if (skill) {
-      lastInput = input;
-      try { await skill.run(input, confirm); }
-      catch (err: any) { console.log(`${c.yellow}Something went wrong: ${err.message}${c.reset}`); }
+    lastInput = input;
+
+    if (await isOnline()) {
+      // Online: let the AI decide what to do.
+      const stop = startSpinner("thinking…");
+      let decision;
+      try { decision = await route(input, tools); }
+      finally { stop(); }
+
+      if (decision.kind === "skill") {
+        await runSkill(decision.name, input, decision.args);
+      } else {
+        stdout.write(`${c.bgreen}sprøut ›${c.reset} `);
+        await typeOut(decision.answer);
+      }
     } else {
-      lastInput = input;
-      const { fast } = pickModel(input);
-      const stop = startSpinner(fast ? "thinking…" : "thinking hard…");
-      const answer = await askAI(input); // memory handled inside askAI now
-      stop();
-      stdout.write(`${c.bgreen}sprøut ›${c.reset} `);
-      await typeOut(answer);
+      // Offline: fall back to the built-in pattern matcher.
+      const skill = match(input);
+      if (skill) {
+        await runSkill(skill.name, input, {});
+      } else {
+        console.log(`${c.dim}You're offline, so I can only run my built-in commands right now (try: organize downloads, status, screenshot, clipboard). Reconnect and I'll be my full self.${c.reset}`);
+      }
     }
     console.log();
   }
+
+  // Clean shutdown: stop the clipboard timer, close input, end the process.
+  clearInterval(clipTimer);
   rl.close();
+  process.exit(0);
 }
 
 main();
